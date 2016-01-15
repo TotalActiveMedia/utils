@@ -1,0 +1,274 @@
+#!/usr/bin/env python
+
+_version = '0.1.2' # 2016-01-15
+
+"""
+Copyright: 2016 totalactivemedia.nl
+Version:   See _version
+Licence:   GPL2
+
+If multiple instances of this are spawned, it makes sure that only one runs at a time.
+With no external dependencies of databases etc.
+"""
+
+import argparse
+import logging
+import os
+import random
+import shutil
+from subprocess import Popen, PIPE
+import stat
+import sys
+import tempfile
+import time
+
+
+STATE_WAITING = 1
+STATE_READY_TO_RUN = 2
+STATE_ACTIVE = 3
+
+STATE = {
+    STATE_WAITING: 'waiting',
+    STATE_READY_TO_RUN: 'ready to run',
+    STATE_ACTIVE:  'active',
+}
+
+
+
+
+class TaskState(object):
+    master_timeout = 15
+    _dbg_lvl = 0
+    _dbg_file = ''# '/tmp/run_in_sequence.log' # if empty any logs will be printed to stdout
+
+    def __init__(self, task_key):
+        if self._dbg_file:
+            logging.basicConfig(filename=self._dbg_file, format='%(asctime)s %(message)s', level=logging.DEBUG)
+        self.pid = os.getpid()
+        self.debug('__init__(%s)' % task_key, 1)
+        self.master_lock_d = os.path.join(tempfile.gettempdir(),'ansible_run_in_sequence-%s' % task_key)
+        self.master_file = os.path.join(self.master_lock_d, 'master')
+        self.my_file = os.path.join(self.master_lock_d, str(self.pid))
+
+        if not self.is_work_environ_ready():
+            self.purge_work_environ()
+            # create the lockdir if this is first instance, this might be run by multiple instances
+            # if they spawn quickly, that should not be a major concern, we do a little wait, and the last
+            # to write their pid to the master_file will be the effective master
+            self.create_work_environ()
+            time.sleep(1) # wait for more instances to join in
+            self.debug('>>>> I believe I am master, it was: %s' % self.get_master(), 1)
+
+        self.set_state(STATE_WAITING, force_state=True)
+
+
+    def set_state(self, state, force_state=False, pid=''):
+        self.debug('set_state(%s, %s, %s)' % (STATE[state], force_state, pid), 1)
+        if not force_state:
+            current_state = self.get_state()
+            if (current_state, state) not in (
+                (STATE_WAITING,      STATE_READY_TO_RUN),
+                (STATE_READY_TO_RUN, STATE_ACTIVE),
+                ):
+               RuntimeError('invalid transition: %s > %s' % (current_state, state))
+        if pid:
+            # check specific file
+            fname = os.path.join(self.master_lock_d, str(pid))
+        else:
+            # check own state
+            fname = self.my_file
+        open(fname,'w').write(STATE[state])
+
+    def ready_to_run(self):
+        self.debug('ready_to_run()', 3)
+        if self.am_i_master():
+            # master will do final bookkeeping on next call
+            self.master_book_keeping()
+        if self.get_state() == STATE[STATE_READY_TO_RUN]:
+            # its my turn!
+            return True
+        else:
+            self.terminate_if_master_has_gone_away()
+        return False
+
+    def cleanup(self):
+        self.debug('cleanup()', 1)
+        os.remove(self.my_file)
+        if self.am_i_master():
+           self.purge_work_environ()
+
+    #
+    # Internals
+    #
+    def is_work_environ_ready(self):
+        self.debug('is_work_environ_ready()', 1)
+        master_pid = self.get_master()
+        if master_pid:
+            try:
+                os.kill(master_pid, 0) # TODO: check param type
+            except OSError:
+                # the master is not running, most probaly this is a leftover from a crashed process,
+                # get rid of it...
+                self.debug('===>  current master gone, work environ is obsolete!  <===', 1)
+                return False # master_pid found but not running
+            return True # master_pid found and running
+        return False # no master_pid found
+
+    def create_work_environ(self):
+        self.debug('create_work_environ()', 1)
+        try:
+            os.makedirs(self.master_lock_d)
+            open(self.master_file,'w').write(str(self.pid))
+        except os.error:
+            # somebody else just created it
+            pass
+
+    def get_state(self, pid=''):
+        self.debug('get_state(%s)' % pid, 5)
+        if pid:
+            # check specific file
+            fname = os.path.join(self.master_lock_d, str(pid))
+        else:
+            # check own state
+            fname = self.my_file
+        s = open(fname).read()
+        return s
+
+    def get_master(self):
+        self.debug('get_master()', 5)
+        try:
+            current_master = int(open(self.master_file).read())
+        except:
+            current_master = 0
+        self.debug('\tcurrent master: %s' % current_master, 4)
+        return int(current_master)
+
+    def am_i_master(self):
+        self.debug('am_i_master()', 5)
+        return self.get_master() == self.pid
+
+    def master_book_keeping(self):
+        self.debug('master_book_keeping()', 3)
+        self.touch_master_file() # indicate to other processes master is alive
+        #   * list all current members
+        allfiles = [f for f in os.listdir(self.master_lock_d) if os.path.isfile(os.path.join(self.master_lock_d, f))]
+        tasks = {}
+        #
+        # sort taks by state
+        #
+        for fname in allfiles:
+            if fname not in ('master', str(self.pid)):
+                state = self.get_state(fname)
+                if state not in tasks.keys():
+                    tasks[state] = []
+                tasks[state] += [fname]
+        if not (STATE[STATE_READY_TO_RUN] in tasks.keys() or STATE[STATE_ACTIVE] in tasks.keys()):
+            # only activate new pid if nothing is running/about to run
+            if STATE[STATE_WAITING] in tasks.keys():
+                # just pic one
+                self.set_state(STATE_READY_TO_RUN, pid=str(tasks[STATE[STATE_WAITING]][0]))
+                q_size = len(tasks[STATE[STATE_WAITING]])
+                self.debug('Remaining processes: %i' % q_size,1) # master is not in the list so this is still a correct # :)
+            else:
+                # all other tasks done, let the master commence!
+                self.set_state(STATE_READY_TO_RUN)
+        return
+
+    def touch_master_file(self):
+        """to indicate that master process is still alive and working"""
+        self.debug('touch_master_file()', 5)
+        os.utime(self.master_file, None)
+
+    def master_file_age_in_seconds(self):
+        self.debug('master_file_age_in_seconds()', 5)
+        age_seconds = time.time() - os.stat(self.master_file)[stat.ST_MTIME]
+        return age_seconds
+
+    def terminate_if_master_has_gone_away(self):
+        self.debug('terminate_if_master_has_gone_away()', 5)
+        if self.master_file_age_in_seconds() > self.master_timeout:
+            self.debug('*** lost master, Im terminating now! ***',1)
+            sys.exit(1)
+        return
+
+    def check_if_work_environ_should_be_cleared(self):
+        self.debug('check_if_work_environ_should_be_cleared()', 1)
+        time.sleep(0.1) # in
+        if not os.path.isdir(self.master_lock_d):
+            return False  # nothing to erase
+        master_pid = self.get_master()
+        if not master_pid:
+            # no master set, probably a broken leftover
+            return True
+        try:
+            os.kill(master_pid, 0) # TODO: check param type
+        except OSError:
+            # the master is not running, most probaly this is a leftover from a crashed process,
+            # get rid of it...
+            return True
+        return False # dont remove a work environ whilst master is running
+
+    def purge_work_environ(self):
+        self.debug('purge_work_environ()', 1)
+        # and (os.path.getmtime(master_lock_d) > 600):
+        tmp_name = '%s-old-%s' % (self.master_lock_d, random.random())
+        try:
+            os.rename(self.master_lock_d, tmp_name)
+            shutil.rmtree(tmp_name)
+        except:
+            pass # was probably not there
+        return
+
+    def debug(self,msg,lvl=1):
+        if lvl > self._dbg_lvl:
+            return
+        output = '[%s] - %s' % (self.pid, msg)
+        if self._dbg_file:
+            logging.debug(output)
+        else:
+            print output
+        return
+
+
+parser = argparse.ArgumentParser(description='Ensure paralell instances of this script are run in sequence.')
+parser.add_argument('--version', action='version', version='%(prog)s '+ _version)
+parser.add_argument("task_name", help="name of this task, to separate it from other tasks")
+parser.add_argument('command')
+parser.add_argument('args', nargs=argparse.REMAINDER, help='args and params to command')
+args = parser.parse_args()
+cmd = ' '.join([args.command]+ args.args)
+
+
+ts = TaskState(args.task_name)
+#
+# Fake delay for master node during testing, to allow for more nodes to be started
+#
+if len(sys.argv) > 1 and sys.argv[1] == 'X':
+    ts.debug('-----> Waiting 10s <------')
+    time.sleep(5)
+    ts.debug('-----> Waiting is done! <------')
+
+while not ts.ready_to_run():
+    time.sleep(0.5)
+
+ts.set_state(STATE_ACTIVE)
+
+#
+# Do your thing
+#
+ts.debug('-----   Doing my thing     -----')
+process = Popen([args.command]+ args.args, stdout=PIPE, stderr=PIPE)
+stdout, stderr = process.communicate()
+ts.debug('-----   My task is done!   -----')
+
+#
+#  Actual work completed
+#
+ts.cleanup()
+
+#
+# Report result to caller
+#
+sys.stdout.write(stdout)
+sys.stderr.write(stderr)
+sys.exit(process.returncode)
