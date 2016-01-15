@@ -1,14 +1,14 @@
 #!/usr/bin/env python
-
 _version = '0.1.2' # 2016-01-15
-
 """
-Copyright: 2016 totalactivemedia.nl
-Version:   See _version
-Licence:   GPL2
+Copyright:  2016 totalactivemedia.nl
+Version:    See _version
+Licence:    GPL2
+Written by: Jacob Lundqvist
 
 If multiple instances of this are spawned, it makes sure that only one runs at a time.
 With no external dependencies of databases etc.
+
 """
 
 import argparse
@@ -162,13 +162,14 @@ class TaskState(object):
                 if state not in tasks.keys():
                     tasks[state] = []
                 tasks[state] += [fname]
+                
         if not (STATE[STATE_READY_TO_RUN] in tasks.keys() or STATE[STATE_ACTIVE] in tasks.keys()):
             # only activate new pid if nothing is running/about to run
             if STATE[STATE_WAITING] in tasks.keys():
-                # just pic one
+                # just pic one at random
                 self.set_state(STATE_READY_TO_RUN, pid=str(tasks[STATE[STATE_WAITING]][0]))
                 q_size = len(tasks[STATE[STATE_WAITING]])
-                self.debug('Remaining processes: %i' % q_size,1) # master is not in the list so this is still a correct # :)
+                self.debug('Remaining processes: %i' % q_size, 1) # master is not in the list so this is still a correct # :)
             else:
                 # all other tasks done, let the master commence!
                 self.set_state(STATE_READY_TO_RUN)
@@ -187,7 +188,7 @@ class TaskState(object):
     def terminate_if_master_has_gone_away(self):
         self.debug('terminate_if_master_has_gone_away()', 5)
         if self.master_file_age_in_seconds() > self.master_timeout:
-            self.debug('*** lost master, Im terminating now! ***',1)
+            self.debug("*** lost master, I'm terminating now! ***", 1)
             sys.exit(1)
         return
 
@@ -240,13 +241,6 @@ cmd = ' '.join([args.command]+ args.args)
 
 
 ts = TaskState(args.task_name)
-#
-# Fake delay for master node during testing, to allow for more nodes to be started
-#
-if len(sys.argv) > 1 and sys.argv[1] == 'X':
-    ts.debug('-----> Waiting 10s <------')
-    time.sleep(5)
-    ts.debug('-----> Waiting is done! <------')
 
 while not ts.ready_to_run():
     time.sleep(0.5)
