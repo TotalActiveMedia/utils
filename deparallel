@@ -57,7 +57,7 @@ class TaskState(object):
             # to write their pid to the master_file will be the effective master
             self.create_work_environ()
             time.sleep(1) # wait for more instances to join in
-            self.debug('>>>> I believe I am master, it was: %s' % self.get_master(), 1)
+            self.debug('>>>> Master pid: %s' % self.get_master(), 1)
 
         self.set_state(STATE_WAITING, force_state=True)
 
