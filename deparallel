@@ -9,6 +9,8 @@ Written by: Jacob Lundqvist
 If multiple instances of this are spawned, it makes sure that only one runs at a time.
 With no external dependencies of databases etc.
 
+I use this in ansible, when specific tasks need to be run in sequence, and the overall job is so long that I want to avoid
+to run it all with serial: 1
 """
 
 import argparse
